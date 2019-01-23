@@ -413,9 +413,9 @@
           ;; Rebind the `cancelable-run-query` function so that we can capture the generated SQL and inspect it
           (let [orig-fn    (var-get #'sql-jdbc.execute/cancelable-run-query)
                 sql-result (atom [])]
-            (with-redefs [sql-jdbc.execute/cancelable-run-query (fn [db sql params opts]
+            (with-redefs [sql-jdbc.execute/cancelable-run-query (fn [{:keys [sql], :as args}]
                                                                   (swap! sql-result conj sql)
-                                                                  (orig-fn db sql params opts))]
+                                                                  (orig-fn args))]
               ;; create a card with the metadata
               ((user->client :rasta) :post 200 "card"
                (assoc (card-with-name-and-query card-name)

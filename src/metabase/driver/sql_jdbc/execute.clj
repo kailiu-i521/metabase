@@ -7,6 +7,7 @@
              [driver :as driver]
              [util :as u]]
             [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+            [metabase.mbql.util :as mbql.u]
             [metabase.query-processor
              [store :as qp.store]
              [util :as qputil]]
@@ -158,13 +159,16 @@
 
 (defn- cancelable-run-query
   "Runs `sql` in such a way that it can be interrupted via a `future-cancel`"
-  [db sql params opts]
-  (with-ensured-connection [conn db]
+  [{:keys [connection sql params opts max-rows]}]
+  (with-ensured-connection [connection connection]
     ;; This is normally done for us by java.jdbc as a result of our `jdbc/query` call
-    (with-open [^PreparedStatement stmt (jdbc/prepare-statement conn sql opts)]
+    (with-open [^PreparedStatement statement (jdbc/prepare-statement connection sql opts)]
+      ;; set the absolute max results returned by the query
+      (when max-rows
+        (.setMaxRows statement max-rows))
       ;; Need to run the query in another thread so that this thread can cancel it if need be
       (try
-        (let [query-future (future (jdbc/query conn (into [stmt] params) opts))]
+        (let [query-future (future (jdbc/query connection (into [statement] params) opts))]
           ;; This thread is interruptable because it's awaiting the other thread (the one actually running the
           ;; query). Interrupting this thread means that the client has disconnected (or we're shutting down) and so
           ;; we can give up on the query running in the future
@@ -173,20 +177,23 @@
           (log/warn e (tru "Client closed connection, cancelling query"))
           ;; This is what does the real work of cancelling the query. We aren't checking the result of
           ;; `query-future` but this will cause an exception to be thrown, saying the query has been cancelled.
-          (.cancel stmt)
+          (.cancel statement)
           (throw e))))))
 
 (defn- run-query
   "Run the query itself."
-  [driver {sql :query, params :params, remark :remark}, ^TimeZone timezone, connection]
+  [driver {sql :query, :keys [params remark max-rows]}, ^TimeZone timezone, connection]
   (let [sql              (str "-- " remark "\n" (hx/unescape-dots sql))
         statement        (into [sql] params)
         [columns & rows] (cancelable-run-query
-                          connection sql params
-                          {:identifiers    identity
-                           :as-arrays?     true
-                           :read-columns   (read-columns driver (some-> timezone Calendar/getInstance))
-                           :set-parameters (set-parameters-with-timezone timezone)})]
+                          {:connection connection
+                           :sql        sql
+                           :params     params
+                           :max-rows   max-rows
+                           :opts       {:identifiers    identity
+                                        :as-arrays?     true
+                                        :read-columns   (read-columns driver (some-> timezone Calendar/getInstance))
+                                        :set-parameters (set-parameters-with-timezone timezone)}})]
     {:rows    (or rows [])
      :columns (map u/keyword->qualified-name columns)}))
 
@@ -264,7 +271,9 @@
 (defn execute-query
   "Process and run a native (raw SQL) QUERY."
   [driver {settings :settings, query :native, :as outer-query}]
-  (let [query (assoc query :remark (qputil/query->remark outer-query))]
+  (let [query (assoc query
+                :remark   (qputil/query->remark outer-query)
+                :max-rows (mbql.u/query->max-rows-limit outer-query))]
     (do-with-try-catch
       (fn []
         (let [db-connection (sql-jdbc.conn/db->pooled-connection-spec (qp.store/database))]
